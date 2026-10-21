@@ -9,12 +9,18 @@ OpenList 目录树导出工具
 依赖：httpx
     pip install httpx
 
-默认连接参数（按 OpenList 官方文档设置）：
-    地址：http://127.0.0.1:5244
+默认连接参数（本机基准值，非官方默认）：
+    地址：http://127.0.0.1:8081
     用户名：admin
     密码：（留空，请填写你自己的密码）
 
-官方默认端口为 5244，如果你修改过 OpenList 的配置，请在此处相应修改。
+官方默认端口是 5244，但本机 OpenList 的 data/config.json 把 http_port 改成了 8081，
+所以这里按本机实际配置来。换机器时改下面 DEFAULT_URL 一处即可。
+
+两种登录方式：
+    1. 用户名 + 密码（GUI 里填）
+    2. 管理员 token：设置环境变量 OPENLIST_TOKEN，程序会跳过登录直接调 API
+       （token 用 `openlist.exe admin token` 获取，本身不带 "Bearer " 前缀）
 """
 
 import os
@@ -28,6 +34,12 @@ from tkinter import filedialog, ttk, simpledialog
 
 import httpx
 
+
+# ========== 连接基准 ==========
+# 本机 OpenList 的实际监听地址（data/config.json -> scheme.http_port）。
+# 都可以用环境变量覆盖，便于换机器而不改代码。
+DEFAULT_URL = os.environ.get("OPENLIST_URL", "http://127.0.0.1:8081")
+DEFAULT_USER = os.environ.get("OPENLIST_USER", "admin")
 
 # ========== 常量 ==========
 STALL_TIMEOUT = 60
@@ -94,9 +106,11 @@ class TreeWriter:
 
 
 class OpenListClient:
-    def __init__(self, base_url):
+    def __init__(self, base_url, token=None):
         self.base_url = base_url.rstrip("/")
-        self.token = None
+        # token 非空时跳过登录，直接带 Authorization 调 API。OpenList 的管理员 token
+        # 本身就是 Authorization 的值，不带 "Bearer " 前缀。
+        self.token = token
         self.http = httpx.Client(
             timeout=30,
             limits=httpx.Limits(max_keepalive_connections=5,
@@ -121,6 +135,14 @@ class OpenListClient:
 
     def _headers(self):
         return {"Authorization": self.token, "Content-Type": "application/json"}
+
+    def check_token(self):
+        """用 /api/me 验证 token，返回用户名；失败时抛异常。"""
+        r = self.http.get(f"{self.base_url}/api/me", headers=self._headers())
+        data = r.json()
+        if data.get("code") != 200:
+            raise Exception(f"token 无效：{data.get('message')}")
+        return (data.get("data") or {}).get("username", "?")
 
     def _post_with_retry(self, endpoint, payload):
         last_err = None
@@ -396,8 +418,8 @@ class OpenListTreeApp:
         root.resizable(False, False)
         center_window(root, WINDOW_W, WINDOW_H)
 
-        self.url_var = tk.StringVar(value="http://127.0.0.1:5244")
-        self.user_var = tk.StringVar(value="admin")
+        self.url_var = tk.StringVar(value=DEFAULT_URL)
+        self.user_var = tk.StringVar(value=DEFAULT_USER)
         self.pass_var = tk.StringVar(value="")
 
         self.output_dir = tk.StringVar(value=get_desktop_path())
@@ -676,18 +698,29 @@ class OpenListTreeApp:
         if not url:
             self._set_status("✗ 请先填写 OpenList 地址。", "err")
             return None, False
-        sig = (url, user, pwd)
+        # OPENLIST_TOKEN 优先：有 token 就不用用户名密码，也不依赖密码是否已知。
+        token = os.environ.get("OPENLIST_TOKEN", "").strip()
+        sig = (url, user, pwd, token)
         if self._client and self._client_sig == sig:
             return self._client, True
         if self._client:
             self._client.close()
-        client = OpenListClient(url)
-        try:
-            client.login(user, pwd)
-        except Exception as e:
-            client.close()
-            self._set_status(f"✗ {e}", "err")
-            return None, False
+        if token:
+            client = OpenListClient(url, token=token)
+            try:
+                client.check_token()
+            except Exception as e:
+                client.close()
+                self._set_status(f"✗ {e}（检查 OPENLIST_TOKEN）", "err")
+                return None, False
+        else:
+            client = OpenListClient(url)
+            try:
+                client.login(user, pwd)
+            except Exception as e:
+                client.close()
+                self._set_status(f"✗ {e}", "err")
+                return None, False
         self._client = client
         self._client_sig = sig
         return client, True
